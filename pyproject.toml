@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datagen"
+version = "0.1.11"
+description = "A easy to use CLI to generate JSONL datasets from a TXT file using LLMs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "TeichAI"}]
+dependencies = [
+  "openai>=1.58.1",
+  "PyYAML>=6.0.1",
+  "requests>=2.32.3",
+]
+
+[project.scripts]
+datagen = "datagen.cli:entrypoint"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["datagen"]
