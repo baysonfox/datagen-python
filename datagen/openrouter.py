@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 import requests
 
 
@@ -193,7 +195,7 @@ def call_openai_compatible_chat(
     api_base: str,
     api_key: str,
     model: str,
-    messages: list[dict[str, str]],
+    messages: Sequence[dict[str, Any]],
     provider: dict[str, Any] | None = None,
     reasoning_effort: str | None = None,
     timeout_ms: int | None = None,
@@ -210,7 +212,7 @@ def call_openai_compatible_chat(
     timeout_seconds = (timeout_ms / 1000.0) if timeout_ms is not None else None
     response = client.chat.completions.create(
         model=model,
-        messages=messages,
+        messages=cast(list[ChatCompletionMessageParam], list(messages)),
         timeout=timeout_seconds,
         extra_body=extra_body if extra_body else None,
     )

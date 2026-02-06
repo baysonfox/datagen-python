@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from datagen import __version__
+from datagen.checkpoint import (
+    append_checkpoint,
+    checkpoint_path_for,
+    finalize_checkpoint,
+    load_checkpoint,
+)
 from datagen.config import load_config_raw_args
 from datagen.messages import (
     build_output_messages,
@@ -269,13 +277,14 @@ def _get_pricing_if_needed(args: Args, api_key: str) -> OpenRouterModelPricing |
 
 
 def _process_one_prompt(
+    idx: int,
     prompt: str,
     line_num: int,
     args: Args,
     api_key: str,
     provider_pref: dict[str, Any] | None,
     pricing: OpenRouterModelPricing | None,
-) -> tuple[str | None, float, str | None, int]:
+) -> tuple[int, str | None, float, str | None, int]:
     try:
         messages = build_request_messages(args.system_prompt, prompt)
         content, reasoning, usage = call_openai_compatible_chat(
@@ -303,13 +312,12 @@ def _process_one_prompt(
                 and pricing.known_request
             ):
                 spent_usd = calculate_openrouter_spend_usd(pricing, usage)
-        return line, spent_usd, None, line_num
+        return idx, line, spent_usd, None, line_num
     except Exception as exc:
-        return None, 0.0, str(exc), line_num
+        return idx, None, 0.0, str(exc), line_num
 
 
 def run(argv: list[str]) -> int:
-    """Runs datagen CLI with provided argv."""
     if "--help" in argv or "-h" in argv:
         print(_help_text())
         return 0
@@ -340,19 +348,50 @@ def run(argv: list[str]) -> int:
     provider_pref = _make_provider_pref(args)
     pricing = _get_pricing_if_needed(args, api_key)
 
+    ckpt_path = checkpoint_path_for(abs_out)
+    completed_results = load_checkpoint(ckpt_path)
+    if completed_results:
+        sys.stderr.write(
+            f"Resuming: {len(completed_results)}/{len(prompts)} prompts already done.\n"
+        )
+
+    pending: list[tuple[int, str, int]] = []
+    for idx, (prompt, line_num) in enumerate(prompts):
+        if idx not in completed_results:
+            pending.append((idx, prompt, line_num))
+
+    total = len(prompts)
     use_progress = args.progress and sys.stderr.isatty()
-    total = count_prompts(abs_prompts) if use_progress else len(prompts)
     bar = ProgressBar(total, stream=sys.stderr) if use_progress and total > 0 else None
 
-    ok_count = 0
+    ok_count = len(completed_results)
     err_count = 0
     spent_usd = 0.0
 
-    with Path(abs_out).open("w", encoding="utf-8") as out_stream:
+    shutdown_event = threading.Event()
+
+    original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _handle_sigint(signum: int, frame: Any) -> None:
+        if shutdown_event.is_set():
+            signal.signal(signal.SIGINT, original_sigint)
+            raise KeyboardInterrupt
+        shutdown_event.set()
+        sys.stderr.write("\nInterrupted. Waiting for in-flight requests to finish…\n")
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    try:
         with ThreadPoolExecutor(max_workers=max(1, args.concurrent)) as executor:
-            futures = [
-                executor.submit(
+            futures: dict[
+                Future[tuple[int, str | None, float, str | None, int]], int
+            ] = {}
+            for idx, prompt, line_num in pending:
+                if shutdown_event.is_set():
+                    break
+                future = executor.submit(
                     _process_one_prompt,
+                    idx,
                     prompt,
                     line_num,
                     args,
@@ -360,28 +399,40 @@ def run(argv: list[str]) -> int:
                     provider_pref,
                     pricing,
                 )
-                for prompt, line_num in prompts
-            ]
+                futures[future] = idx
+
             for future in as_completed(futures):
-                line, delta_spend, error, line_num = future.result()
+                result_idx, line, delta_spend, error, result_line_num = future.result()
                 if error is None and line is not None:
-                    out_stream.write(line + "\n")
+                    completed_results[result_idx] = line
+                    append_checkpoint(ckpt_path, result_idx, line)
                     ok_count += 1
                     spent_usd += delta_spend
                 else:
                     err_count += 1
-                    sys.stderr.write(f"ERR line {line_num}: {error}\n")
+                    sys.stderr.write(f"ERR line {result_line_num}: {error}\n")
                 if bar is not None:
                     bar.render(
                         ok_count + err_count,
                         ProgressStats(ok=ok_count, err=err_count, spent_usd=spent_usd),
                     )
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
 
     if bar is not None:
         bar.finish(
             ok_count + err_count,
             ProgressStats(ok=ok_count, err=err_count, spent_usd=spent_usd),
         )
+
+    if shutdown_event.is_set():
+        sys.stderr.write(
+            f"Checkpoint saved: {ok_count}/{total} done. "
+            f"Re-run same command to resume.\n"
+        )
+        return 130
+
+    finalize_checkpoint(ckpt_path, abs_out, completed_results, total)
     return 0
 
 
