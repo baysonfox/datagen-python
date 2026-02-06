@@ -374,10 +374,13 @@ def run(argv: list[str]) -> int:
 
     def _handle_sigint(signum: int, frame: Any) -> None:
         if shutdown_event.is_set():
-            signal.signal(signal.SIGINT, original_sigint)
+            sys.stderr.write("\nForce quit.\n")
             raise KeyboardInterrupt
         shutdown_event.set()
-        sys.stderr.write("\nInterrupted. Waiting for in-flight requests to finish…\n")
+        sys.stderr.write(
+            "\nInterrupted. Waiting for in-flight requests… "
+            "Press Ctrl+C again to force quit.\n"
+        )
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
