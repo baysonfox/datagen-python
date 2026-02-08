@@ -13,7 +13,7 @@ authors = [{name = "TeichAI"}]
 dependencies = [
   "openai>=1.58.1",
   "PyYAML>=6.0.1",
-  "requests>=2.32.3",
+  "rich>=13.9.4",
 ]
 
 [project.scripts]

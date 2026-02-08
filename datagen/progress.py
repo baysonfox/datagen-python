@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+
 PROMPT_DELIMITER = "---END---"
 
 
@@ -42,94 +50,73 @@ def _format_duration(ms: float) -> str:
     return f"{seconds}s"
 
 
-def _trim_trailing_zeros(number: str) -> str:
-    if "." not in number:
-        return number
-    trimmed = number.rstrip("0").rstrip(".")
-    return trimmed if trimmed else "0"
-
-
-def _format_usd(amount: float) -> str:
-    if amount != amount:
-        return "$0"
-    absolute = abs(amount)
-    if absolute == 0:
-        return "$0"
-    if absolute >= 10:
-        decimals = 2
-    elif absolute >= 1:
-        decimals = 4
-    elif absolute >= 0.01:
-        decimals = 6
-    elif absolute >= 0.0001:
-        decimals = 8
-    else:
-        decimals = 10
-    rounded = round(amount, decimals)
-    if rounded == 0:
-        minimum = 1 / (10**decimals)
-        min_label = _trim_trailing_zeros(f"{minimum:.{decimals}f}")
-        return f">-${min_label}" if amount < 0 else f"<${min_label}"
-    return f"${_trim_trailing_zeros(f'{amount:.{decimals}f}')}"
-
-
 @dataclass(frozen=True)
 class ProgressStats:
     """Progress counters displayed in progress bar."""
 
     ok: int
     err: int
-    spent_usd: float | None = None
 
 
 class ProgressBar:
-    """Terminal progress bar renderer."""
+    """Terminal progress bar renderer based on rich.Progress."""
 
     def __init__(self, total: int, stream: TextIO | None = None) -> None:
         self._total = max(0, total)
         self._stream = stream if stream is not None else sys.stderr
         self._start = time.time()
-        self._last_line = ""
+        self._progress = Progress(
+            TextColumn("{task.percentage:>3.0f}%"),
+            BarColumn(bar_width=None),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn("ok={task.fields[ok]} err={task.fields[err]}"),
+            TextColumn("rps={task.fields[rps]}"),
+            TimeElapsedColumn(),
+            transient=False,
+            expand=True,
+        )
+        self._task_id: TaskID | None = None
+        self._started = False
 
-    def _clear_line(self) -> None:
-        self._stream.write("\x1b[2K\r")
+    def _start_if_needed(self) -> None:
+        if self._started:
+            return
+        self._progress.start()
+        self._task_id = self._progress.add_task(
+            "requests",
+            total=self._total,
+            ok=0,
+            err=0,
+            rps="0.00/s",
+        )
+        self._started = True
 
     def write_line(self, text: str) -> None:
-        self._clear_line()
-        self._stream.write(text + "\n")
-        self._stream.flush()
-        self._last_line = ""
+        self._start_if_needed()
+        self._progress.console.print(text)
 
     def render(self, current: int, stats: ProgressStats | None = None) -> None:
-        safe_current = max(0, current)
-        denominator = self._total if self._total > 0 else 1
-        pct = min(1.0, safe_current / denominator)
-        percent_label = f"{int(pct * 100):3d}%"
-
-        columns = 80
-        suffix_base = f" {safe_current}/{self._total}"
-        suffix_stats = ""
-        suffix_money = ""
-        if stats is not None:
-            suffix_stats = f" ok={stats.ok} err={stats.err}"
-            if stats.spent_usd is not None:
-                suffix_money = f" spent={_format_usd(stats.spent_usd)}"
-        duration = _format_duration((time.time() - self._start) * 1000)
-        suffix = f"{suffix_base}{suffix_stats}{suffix_money} {duration}"
-
-        bar_width = max(10, min(40, columns - len(suffix) - 10))
-        filled = round(bar_width * pct)
-        bar = "█" * filled + "░" * max(0, bar_width - filled)
-        line = f"{percent_label} [{bar}]{suffix}"
-        if line == self._last_line:
+        self._start_if_needed()
+        if self._task_id is None:
             return
-
-        self._clear_line()
-        self._stream.write(line)
-        self._stream.flush()
-        self._last_line = line
+        safe_current = max(0, current)
+        safe_completed = min(safe_current, self._total)
+        elapsed_seconds = max(0.001, time.time() - self._start)
+        rps = f"{(safe_completed / elapsed_seconds):.2f}/s"
+        ok = 0
+        err = 0
+        if stats is not None:
+            ok = stats.ok
+            err = stats.err
+        self._progress.update(
+            self._task_id,
+            completed=safe_completed,
+            ok=ok,
+            err=err,
+            rps=rps,
+        )
 
     def finish(self, current: int, stats: ProgressStats | None = None) -> None:
         self.render(current, stats)
-        self._stream.write("\n")
-        self._stream.flush()
+        if self._started:
+            self._progress.stop()
