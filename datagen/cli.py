@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import signal
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from datagen import __version__
+from datagen.api import call_chat
 from datagen.checkpoint import (
     append_checkpoint,
     checkpoint_path_for,
@@ -25,14 +29,7 @@ from datagen.messages import (
     build_request_messages,
     format_assistant_content,
 )
-from datagen.openrouter import (
-    OpenRouterModelPricing,
-    calculate_openrouter_spend_usd,
-    call_openai_compatible_chat,
-    get_openrouter_model_pricing,
-    is_openrouter_api_base,
-)
-from datagen.progress import PROMPT_DELIMITER, ProgressBar, ProgressStats, count_prompts
+from datagen.progress import PROMPT_DELIMITER, ProgressBar, ProgressStats
 
 
 @dataclass(frozen=True)
@@ -48,10 +45,20 @@ class Args:
     store_system: bool
     progress: bool
     concurrent: int
-    openrouter_provider_order: list[str] | None
-    openrouter_provider_sort: str | None
     reasoning_effort: str | None
+    thinking: bool
     timeout: int | None
+    providers_path: str | None
+    verbose: bool
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """API endpoint configuration for one provider."""
+
+    api_base: str
+    api_key: str
+    model: str | None = None
 
 
 def _usage_line() -> str:
@@ -71,15 +78,16 @@ def _help_text() -> str:
         "  --model <name>                  Model name to use for completions.",
         "  --prompts <file>                Path to a prompts file (multi-line supported).",
         "  --out <file>                    Output JSONL file (default: dataset.jsonl).",
-        "  --api <baseUrl>                 API base URL (default: https://openrouter.ai/api/v1).",
+        "  --api <baseUrl>                 API base URL (default: https://api.openai.com/v1).",
         "  --apikey <key>                  API key (overrides API_KEY env var).",
         "  --system <text>                 Optional system prompt to include.",
         "  --store-system true|false       Whether to emit the system prompt in dataset.",
         "  --concurrent <num>              Number of parallel requests (default: 1).",
-        "  --openrouter.provider <slugs>   OpenRouter provider slugs (comma-separated).",
-        "  --openrouter.providerSort <x>   Provider sorting (price|throughput|latency).",
         "  --reasoningEffort <level>       Reasoning effort.",
+        "  --thinking                      Enable extended thinking.",
         "  --timeout <ms>                  Request timeout in milliseconds.",
+        "  --providers <file>              JSONL file with base_url/apikey/model.",
+        "  --verbose                       Print per-request details.",
         "  --no-progress                   Disable progress bar.",
         "",
     ]
@@ -115,7 +123,7 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
     model = str(raw.get("model", "") or "")
     prompts_path = str(raw.get("prompts", "") or "")
     out_path = str(raw.get("out", "dataset.jsonl") or "dataset.jsonl")
-    api_base = str(raw.get("api", "https://openrouter.ai/api/v1") or "")
+    api_base = str(raw.get("api", "https://api.openai.com/v1") or "")
     system_prompt = str(raw.get("system", "") or "")
 
     store_raw = raw.get("store-system")
@@ -137,26 +145,14 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
         except ValueError:
             concurrent = 1
 
-    provider_raw = raw.get("openrouter.provider")
-    provider_order = None
-    if isinstance(provider_raw, str) and provider_raw.strip():
-        provider_order = [
-            item.strip() for item in provider_raw.split(",") if item.strip()
-        ]
-
-    provider_sort_raw = raw.get("openrouter.providerSort")
-    provider_sort = (
-        provider_sort_raw.strip()
-        if isinstance(provider_sort_raw, str) and provider_sort_raw.strip()
-        else None
-    )
-
     reasoning_effort_raw = raw.get("reasoningEffort")
     reasoning_effort = (
         reasoning_effort_raw.strip()
         if isinstance(reasoning_effort_raw, str) and reasoning_effort_raw.strip()
         else None
     )
+
+    thinking = raw.get("thinking") is not None
 
     timeout_raw = raw.get("timeout")
     timeout: int | None = None
@@ -175,14 +171,24 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
         else None
     )
 
+    providers_raw = raw.get("providers")
+    providers_path = (
+        providers_raw.strip()
+        if isinstance(providers_raw, str) and providers_raw.strip()
+        else None
+    )
+
+    verbose = raw.get("verbose") is not None
+
     if not model or not prompts_path:
         raise ValueError(
             _usage_line()
-            + " [--out dataset.jsonl] [--api https://openrouter.ai/api/v1]"
+            + " [--out dataset.jsonl] [--api https://api.openai.com/v1]"
             + ' [--system "..."] [--store-system true|false]'
-            + " [--concurrent 1] [--openrouter.provider openai,anthropic]"
-            + " [--openrouter.providerSort price|throughput|latency]"
+            + " [--concurrent 1]"
             + " [--reasoningEffort low|medium|high] [--timeout <ms>]"
+            + " [--providers endpoints.jsonl]"
+            + " [--verbose]"
             + " [--no-progress]"
         )
 
@@ -196,10 +202,11 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
         store_system=store_system,
         progress=progress,
         concurrent=concurrent,
-        openrouter_provider_order=provider_order,
-        openrouter_provider_sort=provider_sort,
         reasoning_effort=reasoning_effort,
+        thinking=thinking,
         timeout=timeout,
+        providers_path=providers_path,
+        verbose=verbose,
     )
 
 
@@ -253,27 +260,159 @@ def _read_prompts(file_path: str) -> list[tuple[str, int]]:
     return prompts
 
 
-def _make_provider_pref(args: Args) -> dict[str, Any] | None:
-    if not is_openrouter_api_base(args.api_base):
-        return None
-    if args.openrouter_provider_order is None and args.openrouter_provider_sort is None:
-        return None
-    result: dict[str, Any] = {}
-    if args.openrouter_provider_order is not None:
-        result["order"] = args.openrouter_provider_order
-    if args.openrouter_provider_sort is not None:
-        result["sort"] = args.openrouter_provider_sort
-    return result
+def _load_endpoints_from_jsonl(file_path: str) -> list[Endpoint]:
+    endpoints: list[Endpoint] = []
+    with Path(file_path).open("r", encoding="utf-8") as stream:
+        for index, raw_line in enumerate(stream, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON at providers line {index}: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"Providers line {index} must be a JSON object.")
+
+            base_url = payload.get("base_url")
+            if not isinstance(base_url, str) or not base_url.strip():
+                raise ValueError(
+                    f"Providers line {index} missing non-empty 'base_url'."
+                )
+
+            api_key = payload.get("apikey")
+            if not isinstance(api_key, str) or not api_key.strip():
+                raise ValueError(f"Providers line {index} missing non-empty 'apikey'.")
+
+            model_raw = payload.get("model")
+            model = (
+                model_raw.strip()
+                if isinstance(model_raw, str) and model_raw.strip()
+                else None
+            )
+
+            endpoints.append(
+                Endpoint(
+                    api_base=base_url.strip(),
+                    api_key=api_key.strip(),
+                    model=model,
+                )
+            )
+
+    if not endpoints:
+        raise ValueError("Providers file has no valid endpoints.")
+    return endpoints
 
 
-def _get_pricing_if_needed(args: Args, api_key: str) -> OpenRouterModelPricing | None:
-    if not is_openrouter_api_base(args.api_base):
-        return None
-    try:
-        return get_openrouter_model_pricing(args.api_base, api_key, args.model)
-    except Exception as exc:
-        sys.stderr.write(f"WARN: Failed to fetch OpenRouter models/pricing: {exc}\n")
-        return None
+def _preview_text(text: str, max_chars: int = 50) -> str:
+    """Builds a single-line preview for logs."""
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[:max_chars]
+
+
+def _format_request_result_line(
+    index: int,
+    prompt_preview: str,
+    result_preview: str,
+    output_tokens: int,
+) -> str:
+    """Formats per-request summary line."""
+    return (
+        f"REQ {index + 1}: "
+        f'Q="{prompt_preview}" '
+        f'R="{result_preview}" '
+        f"output_tokens={output_tokens}"
+    )
+
+
+def _format_verbose_line(index: int, message: str) -> str:
+    """Formats one verbose diagnostic line."""
+    return f"VERBOSE REQ {index + 1}: {message}"
+
+
+_RATE_LIMIT_UNTIL_BY_BASE: dict[str, float] = {}
+_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def _normalized_base_url(api_base: str) -> str:
+    """Normalizes endpoint URL for rate-limit map keys."""
+    return api_base.rstrip("/")
+
+
+def _mark_rate_limited(api_base: str, wait_seconds: int) -> None:
+    """Marks one endpoint as rate-limited until now + wait_seconds."""
+    until = time.time() + max(0, wait_seconds)
+    base_key = _normalized_base_url(api_base)
+    with _RATE_LIMIT_LOCK:
+        existing = _RATE_LIMIT_UNTIL_BY_BASE.get(base_key, 0.0)
+        if until > existing:
+            _RATE_LIMIT_UNTIL_BY_BASE[base_key] = until
+
+
+def _wait_for_rate_limit_window(
+    api_base: str, request_index: int, verbose: bool
+) -> None:
+    """Waits if endpoint is currently in a shared rate-limit cooldown."""
+    base_key = _normalized_base_url(api_base)
+    while True:
+        now = time.time()
+        with _RATE_LIMIT_LOCK:
+            until = _RATE_LIMIT_UNTIL_BY_BASE.get(base_key)
+            if until is None or until <= now:
+                if until is not None:
+                    del _RATE_LIMIT_UNTIL_BY_BASE[base_key]
+                return
+            sleep_seconds = max(1, int(math.ceil(until - now)))
+        if verbose:
+            sys.stderr.write(
+                _format_verbose_line(
+                    request_index,
+                    f"cooldown base={api_base} waiting={sleep_seconds}s",
+                )
+                + "\n"
+            )
+        time.sleep(sleep_seconds)
+
+
+def _extract_retry_after_seconds(error_text: str) -> int | None:
+    """Extracts retry-after seconds from an error string."""
+    patterns = [
+        r"retry[- ]?after[^0-9]*(\d+)",
+        r"after[^0-9]*(\d+)\s*s",
+    ]
+    lowered = error_text.lower()
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match is None:
+            continue
+        try:
+            seconds = int(match.group(1))
+        except ValueError:
+            continue
+        if seconds > 0:
+            return seconds
+    return None
+
+
+def _is_http_429_error(error_text: str) -> bool:
+    """Checks whether an exception message indicates HTTP 429."""
+    lowered = error_text.lower()
+    return (
+        "429" in lowered
+        or "too many requests" in lowered
+        or "rate limit reached" in lowered
+        or "rate_limit_exceeded" in lowered
+    )
+
+
+def _wait_seconds_for_429(error_text: str) -> int:
+    """Calculates cooldown seconds for HTTP 429."""
+    retry_after = _extract_retry_after_seconds(error_text)
+    return retry_after if retry_after is not None else 60
 
 
 def _process_one_prompt(
@@ -282,20 +421,88 @@ def _process_one_prompt(
     line_num: int,
     args: Args,
     api_key: str,
-    provider_pref: dict[str, Any] | None,
-    pricing: OpenRouterModelPricing | None,
-) -> tuple[int, str | None, float, str | None, int]:
+    endpoint_pool: list[Endpoint],
+) -> tuple[int, str | None, str | None, int, str, str, int]:
+    prompt_preview = _preview_text(prompt)
     try:
         messages = build_request_messages(args.system_prompt, prompt)
-        content, reasoning, usage = call_openai_compatible_chat(
-            args.api_base,
-            api_key,
-            args.model,
-            messages,
-            provider=provider_pref,
-            reasoning_effort=args.reasoning_effort,
-            timeout_ms=args.timeout,
-        )
+        first_provider_index = idx % len(endpoint_pool)
+        max_attempts = max(2, len(endpoint_pool))
+
+        content = ""
+        reasoning = None
+        usage = None
+        last_error = "Unknown error"
+        for attempt_index in range(max_attempts):
+            endpoint = endpoint_pool[
+                (first_provider_index + attempt_index) % len(endpoint_pool)
+            ]
+            request_model = endpoint.model if endpoint.model is not None else args.model
+            _wait_for_rate_limit_window(endpoint.api_base, idx, args.verbose)
+            if args.verbose:
+                sys.stderr.write(
+                    _format_verbose_line(
+                        idx,
+                        (
+                            f"attempt={attempt_index + 1}/{max_attempts} "
+                            f"base={endpoint.api_base} model={request_model}"
+                        ),
+                    )
+                    + "\n"
+                )
+            try:
+                content, reasoning, usage = call_chat(
+                    endpoint.api_base,
+                    endpoint.api_key,
+                    request_model,
+                    messages,
+                    reasoning_effort=args.reasoning_effort,
+                    thinking=args.thinking,
+                    timeout_ms=args.timeout,
+                )
+                if args.verbose:
+                    completion_tokens = (
+                        usage.completion_tokens if usage is not None else 0
+                    )
+                    sys.stderr.write(
+                        _format_verbose_line(
+                            idx,
+                            (
+                                f"success base={endpoint.api_base} "
+                                f"completion_tokens={completion_tokens}"
+                            ),
+                        )
+                        + "\n"
+                    )
+                break
+            except Exception as exc:
+                exc_text = str(exc)
+                if _is_http_429_error(exc_text):
+                    wait_seconds = _wait_seconds_for_429(exc_text)
+                    _mark_rate_limited(endpoint.api_base, wait_seconds)
+                    sys.stderr.write(
+                        "WARN: HTTP 429 from "
+                        f"{endpoint.api_base}, sleeping {wait_seconds}s before retry.\n"
+                    )
+                    time.sleep(wait_seconds)
+                last_error = (
+                    f"attempt {attempt_index + 1}/{max_attempts} "
+                    f"base={endpoint.api_base}: {exc_text}"
+                )
+                if args.verbose:
+                    sys.stderr.write(
+                        _format_verbose_line(
+                            idx,
+                            (
+                                f"error attempt={attempt_index + 1}/{max_attempts} "
+                                f"base={endpoint.api_base} detail={exc_text}"
+                            ),
+                        )
+                        + "\n"
+                    )
+        else:
+            raise RuntimeError(last_error)
+
         assistant_content = format_assistant_content(content, reasoning)
         output_messages = build_output_messages(
             args.system_prompt,
@@ -304,17 +511,26 @@ def _process_one_prompt(
             args.store_system,
         )
         line = json.dumps({"messages": output_messages}, ensure_ascii=False)
-        spent_usd = 0.0
-        if usage is not None and pricing is not None:
-            if (
-                pricing.known_prompt
-                and pricing.known_completion
-                and pricing.known_request
-            ):
-                spent_usd = calculate_openrouter_spend_usd(pricing, usage)
-        return idx, line, spent_usd, None, line_num
+        output_tokens = usage.completion_tokens if usage is not None else 0
+        return (
+            idx,
+            line,
+            None,
+            line_num,
+            prompt_preview,
+            _preview_text(assistant_content),
+            output_tokens,
+        )
     except Exception as exc:
-        return idx, None, 0.0, str(exc), line_num
+        return (
+            idx,
+            None,
+            str(exc),
+            line_num,
+            prompt_preview,
+            _preview_text(str(exc)),
+            0,
+        )
 
 
 def run(argv: list[str]) -> int:
@@ -331,10 +547,24 @@ def run(argv: list[str]) -> int:
         sys.stderr.write(f"{exc}\n")
         return 1
 
-    api_key = args.api_key or os.environ.get("API_KEY")
-    if not api_key:
-        sys.stderr.write("Missing API key. Provide --apikey or set API_KEY env var.\n")
-        return 1
+    endpoint_pool: list[Endpoint]
+    if args.providers_path is not None:
+        abs_providers = str(Path(args.providers_path).resolve())
+        try:
+            _ensure_readable_file(abs_providers)
+            endpoint_pool = _load_endpoints_from_jsonl(abs_providers)
+        except Exception as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 1
+        api_key = endpoint_pool[0].api_key
+    else:
+        api_key = args.api_key or os.environ.get("API_KEY")
+        if not api_key:
+            sys.stderr.write(
+                "Missing API key. Provide --apikey or set API_KEY env var.\n"
+            )
+            return 1
+        endpoint_pool = [Endpoint(api_base=args.api_base, api_key=api_key)]
 
     abs_prompts = str(Path(args.prompts_path).resolve())
     abs_out = str(Path(args.out_path).resolve())
@@ -345,8 +575,6 @@ def run(argv: list[str]) -> int:
         return 1
 
     prompts = _read_prompts(abs_prompts)
-    provider_pref = _make_provider_pref(args)
-    pricing = _get_pricing_if_needed(args, api_key)
 
     ckpt_path = checkpoint_path_for(abs_out)
     completed_results = load_checkpoint(ckpt_path)
@@ -366,7 +594,6 @@ def run(argv: list[str]) -> int:
 
     ok_count = len(completed_results)
     err_count = 0
-    spent_usd = 0.0
 
     shutdown_event = threading.Event()
 
@@ -387,7 +614,8 @@ def run(argv: list[str]) -> int:
     try:
         with ThreadPoolExecutor(max_workers=max(1, args.concurrent)) as executor:
             futures: dict[
-                Future[tuple[int, str | None, float, str | None, int]], int
+                Future[tuple[int, str | None, str | None, int, str, str, int]],
+                int,
             ] = {}
             for idx, prompt, line_num in pending:
                 if shutdown_event.is_set():
@@ -399,25 +627,43 @@ def run(argv: list[str]) -> int:
                     line_num,
                     args,
                     api_key,
-                    provider_pref,
-                    pricing,
+                    endpoint_pool,
                 )
                 futures[future] = idx
 
             for future in as_completed(futures):
-                result_idx, line, delta_spend, error, result_line_num = future.result()
+                (
+                    result_idx,
+                    line,
+                    error,
+                    result_line_num,
+                    prompt_preview,
+                    result_preview,
+                    output_tokens,
+                ) = future.result()
                 if error is None and line is not None:
                     completed_results[result_idx] = line
                     append_checkpoint(ckpt_path, result_idx, line)
                     ok_count += 1
-                    spent_usd += delta_spend
                 else:
                     err_count += 1
                     sys.stderr.write(f"ERR line {result_line_num}: {error}\n")
+
+                request_line = _format_request_result_line(
+                    result_idx,
+                    prompt_preview,
+                    result_preview,
+                    output_tokens,
+                )
+                if bar is not None:
+                    bar.write_line(request_line)
+                else:
+                    sys.stderr.write(request_line + "\n")
+
                 if bar is not None:
                     bar.render(
                         ok_count + err_count,
-                        ProgressStats(ok=ok_count, err=err_count, spent_usd=spent_usd),
+                        ProgressStats(ok=ok_count, err=err_count),
                     )
     finally:
         signal.signal(signal.SIGINT, original_sigint)
@@ -425,7 +671,7 @@ def run(argv: list[str]) -> int:
     if bar is not None:
         bar.finish(
             ok_count + err_count,
-            ProgressStats(ok=ok_count, err=err_count, spent_usd=spent_usd),
+            ProgressStats(ok=ok_count, err=err_count),
         )
 
     if shutdown_event.is_set():
