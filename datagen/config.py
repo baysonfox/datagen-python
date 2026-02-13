@@ -13,6 +13,7 @@ _CONFIG_KEY_ALIASES: dict[str, str] = {
     "outPath": "out",
     "apiBase": "api",
     "storeSystem": "store-system",
+    "maxTokens": "max-tokens",
     "noProgress": "no-progress",
     "openrouterProviderOrder": "openrouter.provider",
     "openrouterProviderSort": "openrouter.providerSort",

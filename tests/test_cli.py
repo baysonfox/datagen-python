@@ -49,6 +49,11 @@ def test_parse_args_providers_path() -> None:
     assert args.providers_path == "pool.jsonl"
 
 
+def test_parse_args_max_tokens() -> None:
+    args = parse_args(["--model", "m", "--prompts", "p.txt", "--max-tokens", "256"])
+    assert args.max_tokens == 256
+
+
 def test_parse_args_verbose_defaults_false() -> None:
     args = parse_args(["--model", "m", "--prompts", "p.txt"])
     assert args.verbose is False
@@ -73,8 +78,10 @@ def test_run_default_prints_request_line_not_verbose(
         reasoning_effort=None,
         thinking=False,
         timeout_ms=None,
+        max_tokens=None,
     ):
-        del api_base, api_key, model, messages, reasoning_effort, thinking, timeout_ms
+        del api_base, api_key, model, messages
+        del reasoning_effort, thinking, timeout_ms, max_tokens
         return (
             "ok",
             None,
@@ -120,8 +127,10 @@ def test_run_verbose_prints_extra_diagnostics(
         reasoning_effort=None,
         thinking=False,
         timeout_ms=None,
+        max_tokens=None,
     ):
-        del api_base, api_key, model, messages, reasoning_effort, thinking, timeout_ms
+        del api_base, api_key, model, messages
+        del reasoning_effort, thinking, timeout_ms, max_tokens
         return (
             "ok",
             None,
@@ -179,6 +188,7 @@ def test_parse_args_supports_config_yaml(tmp_path: Path) -> None:
                 "store-system: false",
                 "concurrent: 3",
                 "reasoningEffort: high",
+                "max-tokens: 300",
                 "no-progress: true",
                 "",
             ]
@@ -194,6 +204,7 @@ def test_parse_args_supports_config_yaml(tmp_path: Path) -> None:
     assert args.store_system is False
     assert args.concurrent == 3
     assert args.reasoning_effort == "high"
+    assert args.max_tokens == 300
     assert args.progress is False
 
 
@@ -241,8 +252,9 @@ def test_run_uses_round_robin_and_retries(tmp_path: Path, monkeypatch) -> None:
         reasoning_effort=None,
         thinking=False,
         timeout_ms=None,
+        max_tokens=None,
     ):
-        del model, messages, reasoning_effort, thinking, timeout_ms
+        del model, messages, reasoning_effort, thinking, timeout_ms, max_tokens
         calls.append((api_base, api_key))
         if api_base == "https://a.example/v1":
             raise RuntimeError("temporary upstream failure")
@@ -305,8 +317,9 @@ def test_run_provider_model_overrides_default(tmp_path: Path, monkeypatch) -> No
         reasoning_effort=None,
         thinking=False,
         timeout_ms=None,
+        max_tokens=None,
     ):
-        del api_key, messages, reasoning_effort, thinking, timeout_ms
+        del api_key, messages, reasoning_effort, thinking, timeout_ms, max_tokens
         used_models.append((api_base, model))
         return (
             "ok",
@@ -407,8 +420,10 @@ def test_run_429_sleeps_then_retries(tmp_path: Path, monkeypatch) -> None:
         reasoning_effort=None,
         thinking=False,
         timeout_ms=None,
+        max_tokens=None,
     ):
         del api_key, model, messages, reasoning_effort, thinking, timeout_ms
+        del max_tokens
         calls.append(api_base)
         if api_base == "https://a.example/v1":
             raise RuntimeError("429 Too Many Requests; Retry-After: 45")

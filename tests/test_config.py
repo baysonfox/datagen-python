@@ -27,6 +27,7 @@ def test_load_config_raw_args_yaml(tmp_path: Path) -> None:
                 "    - anthropic",
                 "  providerSort: throughput",
                 "reasoningEffort: high",
+                "maxTokens: 512",
                 "no-progress: true",
                 "",
             ]
@@ -44,4 +45,5 @@ def test_load_config_raw_args_yaml(tmp_path: Path) -> None:
     assert result["openrouter.provider"] == "openai,anthropic"
     assert result["openrouter.providerSort"] == "throughput"
     assert result["reasoningEffort"] == "high"
+    assert result["max-tokens"] == "512"
     assert result["no-progress"] is True

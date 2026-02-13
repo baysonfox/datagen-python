@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class CheckpointState:
+    """In-memory checkpoint state for completed and skipped prompts."""
+
+    completed_results: dict[int, str]
+    skipped_indices: set[int]
 
 
 def checkpoint_path_for(out_path: str) -> str:
     return out_path + ".ckpt"
 
 
-def load_checkpoint(ckpt_path: str) -> dict[int, str]:
+def load_checkpoint(ckpt_path: str) -> CheckpointState:
     path = Path(ckpt_path)
     if not path.exists():
-        return {}
+        return CheckpointState(completed_results={}, skipped_indices=set())
     results: dict[int, str] = {}
+    skipped_indices: set[int] = set()
     with path.open("r", encoding="utf-8") as stream:
         for raw_line in stream:
             stripped = raw_line.strip()
@@ -27,14 +37,27 @@ def load_checkpoint(ckpt_path: str) -> dict[int, str]:
             idx = record.get("_idx")
             if not isinstance(idx, int):
                 continue
+            status = record.get("_status")
+            if status == "skipped":
+                skipped_indices.add(idx)
+                results.pop(idx, None)
+                continue
             payload = record.get("_payload")
             if isinstance(payload, str):
                 results[idx] = payload
-    return results
+                skipped_indices.discard(idx)
+    return CheckpointState(completed_results=results, skipped_indices=skipped_indices)
 
 
 def append_checkpoint(ckpt_path: str, idx: int, payload: str) -> None:
     record = json.dumps({"_idx": idx, "_payload": payload}, ensure_ascii=False)
+    with Path(ckpt_path).open("a", encoding="utf-8") as stream:
+        stream.write(record + "\n")
+
+
+def append_checkpoint_skipped(ckpt_path: str, idx: int) -> None:
+    """Appends one skipped prompt marker to checkpoint."""
+    record = json.dumps({"_idx": idx, "_status": "skipped"}, ensure_ascii=False)
     with Path(ckpt_path).open("a", encoding="utf-8") as stream:
         stream.write(record + "\n")
 

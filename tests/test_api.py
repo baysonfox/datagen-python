@@ -142,3 +142,40 @@ def test_call_chat_closes_client(monkeypatch) -> None:
         [{"role": "user", "content": "hi"}],
     )
     assert _FakeOpenAI.closed_count == 1
+
+
+def test_call_chat_forwards_max_tokens(monkeypatch) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class _Message:
+        content = "ok"
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+        usage = None
+
+    class _Completions:
+        def create(self, **kwargs) -> _Response:
+            captured_kwargs.update(kwargs)
+            return _Response()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+            self.chat = _Chat()
+
+    monkeypatch.setattr(datagen.api, "OpenAI", _FakeOpenAI)
+    _ = call_chat(
+        "https://api.openai.com/v1",
+        "k",
+        "m",
+        [{"role": "user", "content": "hi"}],
+        max_tokens=222,
+    )
+    assert captured_kwargs["max_tokens"] == 222

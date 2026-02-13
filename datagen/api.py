@@ -19,6 +19,10 @@ class Usage:
     total_tokens: int = 0
 
 
+class FinishReasonLengthError(RuntimeError):
+    """Raised when API returns finish_reason='length'."""
+
+
 CHERRY_STUDIO_HTTP_REFERER = "https://cherry-ai.com"
 CHERRY_STUDIO_X_TITLE = "Cherry Studio"
 CHERRY_STUDIO_USER_AGENT = (
@@ -106,6 +110,24 @@ def _extract_reasoning_from_message(message: Any) -> str | None:
     return None
 
 
+def _serialize_response_for_error(response: Any) -> str:
+    """Serializes full API response for error reporting."""
+    model_dump_json = getattr(response, "model_dump_json", None)
+    if callable(model_dump_json):
+        try:
+            return str(model_dump_json())
+        except Exception:
+            pass
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            return str(dumped)
+        except Exception:
+            pass
+    return str(response)
+
+
 def call_chat(
     api_base: str,
     api_key: str,
@@ -114,6 +136,7 @@ def call_chat(
     reasoning_effort: str | None = None,
     thinking: bool = False,
     timeout_ms: int | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, str | None, Usage | None]:
     """Calls an OpenAI-compatible chat/completions endpoint.
 
@@ -125,6 +148,7 @@ def call_chat(
         reasoning_effort: Optional reasoning effort level.
         thinking: Whether to enable extended thinking.
         timeout_ms: Optional request timeout in milliseconds.
+        max_tokens: Optional max completion tokens.
 
     Returns:
         A tuple of (content, reasoning, usage).
@@ -150,17 +174,31 @@ def call_chat(
             model=model,
             messages=cast(list[ChatCompletionMessageParam], list(messages)),
             timeout=timeout_seconds,
+            max_tokens=max_tokens,
             extra_body=extra_body if extra_body else None,
         )
 
         content = ""
         reasoning = None
-        if response.choices:
-            message = response.choices[0].message
-            content = _extract_text(getattr(message, "content", None))
-            reasoning = _extract_reasoning_from_message(message)
+        if not response.choices:
+            raise FinishReasonLengthError("no assistant message returned")
+
+        first_choice = response.choices[0]
+        if getattr(first_choice, "finish_reason", None) == "length":
+            raise FinishReasonLengthError("finish_reason is length")
+
+        message = getattr(first_choice, "message", None)
+        if message is None:
+            raise FinishReasonLengthError("no assistant message returned")
+
+        message_role = getattr(message, "role", None)
+        if message_role is not None and message_role != "assistant":
+            raise FinishReasonLengthError("no assistant message returned")
+
+        content = _extract_text(getattr(message, "content", None))
+        reasoning = _extract_reasoning_from_message(message)
         if not content:
-            raise RuntimeError("No assistant content returned from API.")
+            raise FinishReasonLengthError("No assistant content returned from API")
 
         usage = None
         if response.usage is not None:

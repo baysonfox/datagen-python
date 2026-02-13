@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import signal
 import sys
@@ -16,9 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from datagen import __version__
-from datagen.api import call_chat
+from datagen.api import FinishReasonLengthError, call_chat
 from datagen.checkpoint import (
     append_checkpoint,
+    append_checkpoint_skipped,
     checkpoint_path_for,
     finalize_checkpoint,
     load_checkpoint,
@@ -48,6 +50,7 @@ class Args:
     reasoning_effort: str | None
     thinking: bool
     timeout: int | None
+    max_tokens: int | None
     providers_path: str | None
     verbose: bool
 
@@ -59,6 +62,47 @@ class Endpoint:
     api_base: str
     api_key: str
     model: str | None = None
+
+
+class ProviderSlotPool:
+    """Manages fixed provider slots for request scheduling."""
+
+    def __init__(self, endpoint_pool: list[Endpoint], concurrent: int) -> None:
+        if not endpoint_pool:
+            raise ValueError("endpoint_pool must not be empty")
+        self._endpoint_pool = endpoint_pool
+        self._available_slots: queue.Queue[int] = queue.Queue()
+        self._slot_to_endpoint_index: list[int] = []
+
+        provider_count = len(endpoint_pool)
+        base_slots = concurrent // provider_count
+        remainder_slots = concurrent % provider_count
+        for endpoint_index in range(provider_count):
+            provider_slots = base_slots + (1 if endpoint_index < remainder_slots else 0)
+            for _ in range(provider_slots):
+                slot_index = len(self._slot_to_endpoint_index)
+                self._slot_to_endpoint_index.append(endpoint_index)
+                self._available_slots.put(slot_index)
+
+        if not self._slot_to_endpoint_index:
+            slot_index = 0
+            self._slot_to_endpoint_index.append(0)
+            self._available_slots.put(slot_index)
+
+    def acquire(self) -> tuple[int, Endpoint]:
+        """Acquires one free slot and returns (slot_index, endpoint)."""
+        slot_index = self._available_slots.get(block=True)
+        endpoint_index = self._slot_to_endpoint_index[slot_index]
+        return slot_index, self._endpoint_pool[endpoint_index]
+
+    def release(self, slot_index: int) -> None:
+        """Releases one slot back to pool."""
+        self._available_slots.put(slot_index)
+
+    @property
+    def slot_count(self) -> int:
+        """Returns total slot count."""
+        return len(self._slot_to_endpoint_index)
 
 
 def _usage_line() -> str:
@@ -86,6 +130,7 @@ def _help_text() -> str:
         "  --reasoningEffort <level>       Reasoning effort.",
         "  --thinking                      Enable extended thinking.",
         "  --timeout <ms>                  Request timeout in milliseconds.",
+        "  --max-tokens <num>              Max completion tokens per request.",
         "  --providers <file>              JSONL file with base_url/apikey/model.",
         "  --verbose                       Print per-request details.",
         "  --no-progress                   Disable progress bar.",
@@ -164,6 +209,16 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
         except ValueError:
             timeout = None
 
+    max_tokens_raw = raw.get("max-tokens")
+    max_tokens: int | None = None
+    if max_tokens_raw is not None:
+        try:
+            parsed = int(float(str(max_tokens_raw)))
+            if parsed > 0:
+                max_tokens = parsed
+        except ValueError:
+            max_tokens = None
+
     apikey_raw = raw.get("apikey")
     api_key = (
         apikey_raw.strip()
@@ -187,6 +242,7 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
             + ' [--system "..."] [--store-system true|false]'
             + " [--concurrent 1]"
             + " [--reasoningEffort low|medium|high] [--timeout <ms>]"
+            + " [--max-tokens <num>]"
             + " [--providers endpoints.jsonl]"
             + " [--verbose]"
             + " [--no-progress]"
@@ -205,6 +261,7 @@ def _parse_args_from_raw(raw: dict[str, str | bool]) -> Args:
         reasoning_effort=reasoning_effort,
         thinking=thinking,
         timeout=timeout,
+        max_tokens=max_tokens,
         providers_path=providers_path,
         verbose=verbose,
     )
@@ -421,36 +478,34 @@ def _process_one_prompt(
     line_num: int,
     args: Args,
     api_key: str,
-    endpoint_pool: list[Endpoint],
+    slot_pool: ProviderSlotPool,
 ) -> tuple[int, str | None, str | None, int, str, str, int]:
     prompt_preview = _preview_text(prompt)
     try:
         messages = build_request_messages(args.system_prompt, prompt)
-        first_provider_index = idx % len(endpoint_pool)
-        max_attempts = max(2, len(endpoint_pool))
+        max_attempts = max(2, slot_pool.slot_count)
 
         content = ""
         reasoning = None
         usage = None
         last_error = "Unknown error"
         for attempt_index in range(max_attempts):
-            endpoint = endpoint_pool[
-                (first_provider_index + attempt_index) % len(endpoint_pool)
-            ]
+            slot_index, endpoint = slot_pool.acquire()
             request_model = endpoint.model if endpoint.model is not None else args.model
-            _wait_for_rate_limit_window(endpoint.api_base, idx, args.verbose)
-            if args.verbose:
-                sys.stderr.write(
-                    _format_verbose_line(
-                        idx,
-                        (
-                            f"attempt={attempt_index + 1}/{max_attempts} "
-                            f"base={endpoint.api_base} model={request_model}"
-                        ),
-                    )
-                    + "\n"
-                )
             try:
+                _wait_for_rate_limit_window(endpoint.api_base, idx, args.verbose)
+                if args.verbose:
+                    sys.stderr.write(
+                        _format_verbose_line(
+                            idx,
+                            (
+                                f"attempt={attempt_index + 1}/{max_attempts} "
+                                f"slot={slot_index} "
+                                f"base={endpoint.api_base} model={request_model}"
+                            ),
+                        )
+                        + "\n"
+                    )
                 content, reasoning, usage = call_chat(
                     endpoint.api_base,
                     endpoint.api_key,
@@ -459,6 +514,7 @@ def _process_one_prompt(
                     reasoning_effort=args.reasoning_effort,
                     thinking=args.thinking,
                     timeout_ms=args.timeout,
+                    max_tokens=args.max_tokens,
                 )
                 if args.verbose:
                     completion_tokens = (
@@ -468,6 +524,7 @@ def _process_one_prompt(
                         _format_verbose_line(
                             idx,
                             (
+                                f"slot={slot_index} "
                                 f"success base={endpoint.api_base} "
                                 f"completion_tokens={completion_tokens}"
                             ),
@@ -475,6 +532,16 @@ def _process_one_prompt(
                         + "\n"
                     )
                 break
+            except FinishReasonLengthError:
+                return (
+                    idx,
+                    None,
+                    "SKIP_FINISH_REASON_LENGTH",
+                    line_num,
+                    prompt_preview,
+                    "finish_reason=length",
+                    0,
+                )
             except Exception as exc:
                 exc_text = str(exc)
                 if _is_http_429_error(exc_text):
@@ -487,6 +554,7 @@ def _process_one_prompt(
                     time.sleep(wait_seconds)
                 last_error = (
                     f"attempt {attempt_index + 1}/{max_attempts} "
+                    f"slot={slot_index} "
                     f"base={endpoint.api_base}: {exc_text}"
                 )
                 if args.verbose:
@@ -495,11 +563,14 @@ def _process_one_prompt(
                             idx,
                             (
                                 f"error attempt={attempt_index + 1}/{max_attempts} "
+                                f"slot={slot_index} "
                                 f"base={endpoint.api_base} detail={exc_text}"
                             ),
                         )
                         + "\n"
                     )
+            finally:
+                slot_pool.release(slot_index)
         else:
             raise RuntimeError(last_error)
 
@@ -577,23 +648,29 @@ def run(argv: list[str]) -> int:
     prompts = _read_prompts(abs_prompts)
 
     ckpt_path = checkpoint_path_for(abs_out)
-    completed_results = load_checkpoint(ckpt_path)
+    checkpoint_state = load_checkpoint(ckpt_path)
+    completed_results = checkpoint_state.completed_results
+    skipped_indices = checkpoint_state.skipped_indices
     if completed_results:
         sys.stderr.write(
             f"Resuming: {len(completed_results)}/{len(prompts)} prompts already done.\n"
         )
+    if skipped_indices:
+        sys.stderr.write(f"Resuming: {len(skipped_indices)} prompts already skipped.\n")
 
     pending: list[tuple[int, str, int]] = []
     for idx, (prompt, line_num) in enumerate(prompts):
-        if idx not in completed_results:
+        if idx not in completed_results and idx not in skipped_indices:
             pending.append((idx, prompt, line_num))
 
     total = len(prompts)
     use_progress = args.progress and sys.stderr.isatty()
     bar = ProgressBar(total, stream=sys.stderr) if use_progress and total > 0 else None
+    slot_pool = ProviderSlotPool(endpoint_pool, args.concurrent)
 
     ok_count = len(completed_results)
     err_count = 0
+    skipped_count = len(skipped_indices)
 
     shutdown_event = threading.Event()
 
@@ -627,7 +704,7 @@ def run(argv: list[str]) -> int:
                     line_num,
                     args,
                     api_key,
-                    endpoint_pool,
+                    slot_pool,
                 )
                 futures[future] = idx
 
@@ -645,6 +722,13 @@ def run(argv: list[str]) -> int:
                     completed_results[result_idx] = line
                     append_checkpoint(ckpt_path, result_idx, line)
                     ok_count += 1
+                elif error == "SKIP_FINISH_REASON_LENGTH":
+                    skipped_count += 1
+                    skipped_indices.add(result_idx)
+                    append_checkpoint_skipped(ckpt_path, result_idx)
+                    sys.stderr.write(
+                        f"SKIP line {result_line_num}: finish_reason=length\n"
+                    )
                 else:
                     err_count += 1
                     sys.stderr.write(f"ERR line {result_line_num}: {error}\n")
@@ -662,16 +746,24 @@ def run(argv: list[str]) -> int:
 
                 if bar is not None:
                     bar.render(
-                        ok_count + err_count,
-                        ProgressStats(ok=ok_count, err=err_count),
+                        ok_count + err_count + skipped_count,
+                        ProgressStats(
+                            ok=ok_count,
+                            err=err_count,
+                            skipped=skipped_count,
+                        ),
                     )
     finally:
         signal.signal(signal.SIGINT, original_sigint)
 
     if bar is not None:
         bar.finish(
-            ok_count + err_count,
-            ProgressStats(ok=ok_count, err=err_count),
+            ok_count + err_count + skipped_count,
+            ProgressStats(
+                ok=ok_count,
+                err=err_count,
+                skipped=skipped_count,
+            ),
         )
 
     if shutdown_event.is_set():

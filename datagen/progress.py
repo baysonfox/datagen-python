@@ -56,6 +56,7 @@ class ProgressStats:
 
     ok: int
     err: int
+    skipped: int
 
 
 class ProgressBar:
@@ -69,7 +70,9 @@ class ProgressBar:
             TextColumn("{task.percentage:>3.0f}%"),
             BarColumn(bar_width=None),
             TextColumn("{task.completed}/{task.total}"),
-            TextColumn("ok={task.fields[ok]} err={task.fields[err]}"),
+            TextColumn(
+                "ok={task.fields[ok]} err={task.fields[err]} skip={task.fields[skipped]}"
+            ),
             TextColumn("rps={task.fields[rps]}"),
             TimeElapsedColumn(),
             transient=False,
@@ -87,6 +90,7 @@ class ProgressBar:
             total=self._total,
             ok=0,
             err=0,
+            skipped=0,
             rps="0.00/s",
         )
         self._started = True
@@ -105,14 +109,17 @@ class ProgressBar:
         rps = f"{(safe_completed / elapsed_seconds):.2f}/s"
         ok = 0
         err = 0
+        skipped = 0
         if stats is not None:
             ok = stats.ok
             err = stats.err
+            skipped = stats.skipped
         self._progress.update(
             self._task_id,
             completed=safe_completed,
             ok=ok,
             err=err,
+            skipped=skipped,
             rps=rps,
         )
 
